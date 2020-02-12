@@ -1,0 +1,163 @@
+pipeline {
+    agent any
+    environment {
+        branchName = "master"
+        scmUrl = "https://github.com/blacktiago/superApp.git"
+        node_version = "v10.16.3"
+        appc_cli_v = "7.1.2"
+        appc_sdk_v = "8.3.1.GA"
+    }
+    parameters {
+        choice(name: 'dist_type',
+                choices: ['Build Only', 'Google Play dist'],
+                description: 'Distribution type')
+
+        booleanParam(name: 'appcLogin',
+                defaultValue: true,
+                description: 'Should perform axway appcelerator login? it should be execute al least one time')
+
+        booleanParam(name: 'tag_release',
+                defaultValue: false,
+                description: 'tag this version? should be execute once on android or ios release')
+
+        booleanParam(name: 'google_play_upload',
+                defaultValue: false,
+                description: 'upload dist to google play store')
+
+        choice(name: 'base_url',
+                choices: ['https://dev.superapp.com/api/','https://stage.superapp.com/api/','https://prod.superapp.com/api/'],
+                description: 'Address for rest services consumption')
+
+        string(name: 'output_dir',
+                defaultValue: '/opt/blacktiago/mobile/dist/',
+                description: 'Output dir for .apk file, be sure to have write privileges')
+
+        string(name: 'keystore',
+                defaultValue: '/opt/blacktiago/mobile/android.keystore',
+                description: 'Keystore path for google play store distribution')
+
+    }
+    stages {
+        stage("checkout git") {
+            steps {
+                git branch: params.branchName, credentialsId: "jenkinsmobile", url: scmUrl
+                script {
+                    shortCommit = sh(returnStdout: true, script: 'git log -n 1 --pretty=format:"%h"').trim()
+                    env.LAST_COMMIT = shortCommit
+                }
+            }
+        }
+        stage("set up project config"){
+            steps {
+                script {
+                    def file = new File(pwd()+"/tiapp.xml")
+                    def xml = new XmlSlurper().parse(file)
+                    def nodesUrl = xml.depthFirst().findAll { it.@name == "baseURL"}
+                    nodesUrl[0].replaceBody params.base_url
+                    def deployVersion = xml.depthFirst().findAll { it.name() == 'version'}
+                    env.version = deployVersion[0].text()
+                    env.apkArchive = xml.name.text()
+
+                    println "Creating app["+nodesUrl[0]+"]"
+                    def updatedXml = groovy.xml.XmlUtil.serialize(xml)
+                    file.write(updatedXml)
+                }
+            }
+        }
+        stage("appc login"){
+            when {
+                expression {
+                    return params.appcLogin
+                }
+            }
+            steps{
+                nvm(node_version) {
+                    withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: 'appcCredentialId', usernameVariable: 'appc_user', passwordVariable: 'appc_pass']]) {
+                        sh 'appc login --username $appc_user --password $appc_pass'
+                    }
+                }
+            }
+        }
+
+        stage("build only") {
+            when {
+                expression {
+                    return params.dist_type == 'Build Only'
+                }
+            }
+            steps {
+                nvm(node_version){
+                    script{
+                        sh 'appc use '+appc_cli_v
+                        sh 'appc ti sdk select '+appc_sdk_v
+                        sh 'appc ti clean '
+                        sh 'appc run -p android -b '
+                        println "Apk destination path: "+params.output_dir
+                        def exists = fileExists "${output_dir}"
+                        if (exists) {
+                            dir = pwd()
+                            sh "yes | cp -rf '${dir}/build/android/bin/SuperApp.apk' '${output_dir}'"
+                        } else {
+                            println "Destination path does not exist using: "+pwd()+"/build/android/bin/"
+                        }
+                    }
+                }
+            }
+        }
+
+        stage("Google Play dist") {
+            when {
+                expression {
+                    return params.dist_type == 'Google Play dist'
+                }
+            }
+            steps {
+                println "Apk destination path: "+params.output_dir
+                nvm(node_version){
+                    script{
+                        sh 'appc use '+appc_cli_v
+                        sh 'appc ti sdk select '+appc_sdk_v
+                        sh 'appc ti clean '
+                        withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId:'GooglePlayKeyStoreCredentialId', usernameVariable: 'keyStoreUser', passwordVariable: 'keyStorePass']]) {
+                            sh 'appc run -p android -T dist-playstore -K '+ params.keystore +' -P $keyStorePass -L $keyStoreUser -O '+ params.output_dir
+
+                            if(params.google_play_update){
+                                println "Searching apk at : "+params.output_dir +"/" + env.apkArchive + ".apk"
+                                androidApkUpload googleCredentialsId: 'binGoogleCredential', apkFilesPattern: params.output_dir +"/" + env.apkArchive + ".apk", trackName: 'internal'
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        stage("Tag release"){
+            when {
+                 expression {
+                     return params.tag_release
+                 }
+            }
+            steps{
+                git tag -fa +"v"+env.version -m +"Tag of version "+env.version
+            }
+        }
+    }
+    post {
+        always {
+            script {
+
+                if (currentBuild.currentResult == "SUCCESS") {
+                    slackSend color: "good", message: "Job: ${env.JOB_NAME} with buildnumber ${env.BUILD_NUMBER} was successful"
+                } else if (currentBuild.currentResult == "FAILURE") {
+                    slackSend color: "danger", message: "Job: ${env.JOB_NAME} with buildnumber ${env.BUILD_NUMBER} was failed"
+                } else if (currentBuild.currentResult == "UNSTABLE") {
+                    slackSend color: "warning", message: "Job: ${env.JOB_NAME} with buildnumber ${env.BUILD_NUMBER} was unstable"
+                } else {
+                    slackSend color: "danger", message: "Job: ${env.JOB_NAME} with buildnumber ${env.BUILD_NUMBER} its resulat was unclear"
+                }
+            }
+
+            cleanWs()
+        }
+    }
+}

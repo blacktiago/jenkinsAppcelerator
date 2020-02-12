@@ -1,0 +1,157 @@
+pipeline {
+    agent any
+    environment {
+        scmUrl = "https://github.com/blacktiago/superApp.git"
+        node_version = "v10.16.3"
+        appc_cli_v = "7.1.2"
+        appc_sdk_v = "8.3.1.GA"
+    }
+    parameters {
+
+        booleanParam(name: 'appcLogin',
+                defaultValue: false,
+                description: 'Ejecuta login de axway appcelerator (ejecutar una vez por ejecución)')
+
+        string(name: 'branchName',
+                defaultValue: 'master',
+                description: 'The branch to build, (leave empty to interactive branch list)')
+
+        choice(name: 'base_url',
+                choices: ['https://dev.superapp.com/api/','https://stage.superapp.com/api/','https://prod.superapp.com/api/'],
+                description: 'Address for mcm rest services consumption')
+
+        choice(name: 'dist_type',
+                choices: ['Ad Hoc', 'iTunes'],
+                description: 'Distribution type')
+
+        choice(name: 'bundle_id',
+                choices: ['com.black.superapp.dev', 'com.black.superapp.hadhoc'],
+                description: 'Distribution type')
+
+        string(name: 'build_version',
+                defaultValue: '1.0,0',
+                description: 'Version for ipa in TestFlight. Verify last version in AppleDeveloper/TestFlight')
+
+        string(name: 'output_dir',
+                defaultValue: '$HOME/dist',
+                description: 'Output dir for .ipa file, be sure to have write privileges')
+
+        string(name: 'dist_cert',
+                defaultValue: 'Your certification name here',
+                description: 'Distribution Certificate')
+
+        string(name: 'profile',
+                defaultValue: 'Your provisioning profile here',
+                description: 'IOS provisioning profile ID')
+
+        string(name: 'appLoader',
+                defaultValue: '/Applications/Xcode.app/Contents/Applications/Application Loader.app/Contents/Frameworks/ITunesSoftwareService.framework/Support/altool',
+                description: 'AppLoader Path')
+
+
+    }
+    stages {
+        stage("checkout git") {
+            steps {
+                git branch: params.branchName, credentialsId: "jenkinsmobile", url: scmUrl
+                script {
+                    shortCommit = sh(returnStdout: true, script: 'git log -n 1 --pretty=format:"%h"').trim()
+                    env.LAST_COMMIT = shortCommit
+                }
+            }
+        }
+        stage("set up project config"){
+            steps {
+                script {
+                    def file = new File(pwd()+"/tiapp.xml")
+                    def xml = new XmlSlurper().parse(file)
+                    def nodesUrl = xml.depthFirst().findAll { it.@name == "baseURL"}
+                    nodesUrl[0].replaceBody params.base_url
+                    def deployVersion = xml.depthFirst().findAll { it.name() == 'version'}
+                    deployVersion[0].replaceBody params.build_version
+                    xml.id.replaceBody params.bundle_id
+                    env.ipaArchive = xml.name.text()
+
+                    println "Creating app["+nodesUrl[0]+"] version["+deployVersion[0]+"] bundleId["+xml.id+"]"
+                    def updatedXml = groovy.xml.XmlUtil.serialize(xml)
+                    file.write(updatedXml)
+                }
+            }
+        }
+        stage("appc login"){
+            when {
+                expression {
+                    return params.appcLogin
+                }
+            }
+            steps{
+                sh 'export NVM_DIR=~/.nvm'
+                nvm(node_version){
+                    withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId:'appcCredentialId', usernameVariable: 'appc_user', passwordVariable: 'appc_pass']]) {
+                        sh 'appc login --username $appc_user --password $appc_pass'
+                    }
+                }
+            }
+        }
+        stage("appc environment") {
+            steps {
+                nvm(node_version){
+                    sh 'appc ti sdk select '+appc_sdk_v
+                    sh 'appc use '+appc_cli_v
+                }
+            }
+        }
+        stage("appc clean") {
+            steps {
+                nvm(node_version){
+                    sh 'appc ti clean '
+                }
+            }
+        }
+        stage("appc Ad hoc") {
+            when {
+                expression {
+                    return params.dist_type == 'Ad Hoc'
+                }
+            }
+            steps {
+                sh 'appc run -p ios -b -T dist-adhoc -R "$dist_cert" -P $profile -O '+ params.output_dir
+            }
+        }
+        stage("appc iTunes archive") {
+            when {
+                expression {
+                    return params.dist_type == 'iTunes'
+                }
+            }
+            steps {
+                sh 'appc run -p ios -T dist-appstore -R "$dist_cert" -P $profile -O '+ params.output_dir
+            }
+        }
+        stage("appc iTunes upload") {
+            steps {
+                withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId:'iTunesConnect', usernameVariable: 'USER', passwordVariable: 'PASS']]) {
+                    sh "'$appLoader' --upload-app -f " + params.output_dir +"/" + env.ipaArchive + ".ipa -u '$USER' -p '$PASS'"
+                }
+            }
+        }
+    }
+    post {
+        always {
+            script {
+
+                if (currentBuild.currentResult == "SUCCESS") {
+                    slackSend color: "good", message: "Job: ${env.JOB_NAME} with buildnumber ${env.BUILD_NUMBER} was successful"
+                } else if (currentBuild.currentResult == "FAILURE") {
+                    slackSend color: "danger", message: "Job: ${env.JOB_NAME} with buildnumber ${env.BUILD_NUMBER} was failed"
+                } else if (currentBuild.currentResult == "UNSTABLE") {
+                    slackSend color: "warning", message: "Job: ${env.JOB_NAME} with buildnumber ${env.BUILD_NUMBER} was unstable"
+                } else {
+                    slackSend color: "danger", message: "Job: ${env.JOB_NAME} with buildnumber ${env.BUILD_NUMBER} its resulat was unclear"
+                }
+            }
+
+            cleanWs()
+        }
+    }
+}
